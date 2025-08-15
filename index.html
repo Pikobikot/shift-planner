@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Shift Planner – simple</title>
+    <meta name="theme-color" content="#1877f2" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" type="image/png" sizes="512x512" href="./icons/icon-512.png" />
+    <script>
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('./sw.js').catch(console.error);
+        });
+      }
+    </script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React & Babel CDN -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- date-fns -->
+    <script src="https://unpkg.com/date-fns@3.6.0/dist/date-fns.min.js"></script>
+    <script src="https://unpkg.com/date-fns@3.6.0/locale/fr/index.js"></script>
+  </head>
+  <body class="min-h-screen bg-zinc-50">
+    <div id="root"></div>
+
+    <script type="text/babel">
+      const { useEffect, useMemo, useState } = React;
+      const { addDays, differenceInCalendarDays, eachDayOfInterval, endOfMonth, format, isSameDay, parseISO, startOfMonth } = dateFns;
+      const fr = dateFnsLocaleFr;
+
+      const SHIFT_TYPES = {
+        JOUR: { key: "JOUR", label: "Jour", code: "J", color: "bg-emerald-100 text-emerald-800 border-emerald-300" },
+        NUIT: { key: "NUIT", label: "Nuit", code: "N", color: "bg-indigo-100 text-indigo-800 border-indigo-300" },
+        REPOS: { key: "REPOS", label: "Repos", code: "R", color: "bg-zinc-100 text-zinc-700 border-zinc-300" },
+        OFF: { key: "OFF", label: "Congé", code: "O", color: "bg-amber-100 text-amber-800 border-amber-300" },
+      };
+
+      const DEFAULT_PATTERN = [
+        SHIFT_TYPES.JOUR.key,
+        SHIFT_TYPES.JOUR.key,
+        SHIFT_TYPES.REPOS.key,
+        SHIFT_TYPES.REPOS.key,
+        SHIFT_TYPES.NUIT.key,
+        SHIFT_TYPES.NUIT.key,
+      ];
+
+      const prettyMoney = (n) => new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR", maximumFractionDigits: 2 }).format(Number(n || 0));
+      const load = (k, v) => { try { const raw = localStorage.getItem(k); return raw ? JSON.parse(raw) : v; } catch { return v; } };
+      const save = (k, v) => localStorage.setItem(k, JSON.stringify(v));
+
+      function App() {
+        const today = new Date();
+        const [year, setYear] = useState(load("sp.year", today.getFullYear()));
+        const [month, setMonth] = useState(load("sp.month", today.getMonth()));
+        const [pattern, setPattern] = useState(load("sp.pattern", DEFAULT_PATTERN));
+        const [patternStartDate, setPatternStartDate] = useState(load("sp.patternStartDate", dateFns.format(today, "yyyy-MM-01")));
+        const [patternStartShiftIndex, setPatternStartShiftIndex] = useState(load("sp.patternStartShiftIndex", 0));
+
+        const [rateDay, setRateDay] = useState(load("sp.rateDay", 100));
+        const [rateNight, setRateNight] = useState(load("sp.rateNight", 120));
+        const [defaultPrime, setDefaultPrime] = useState(load("sp.defaultPrime", 0));
+        const [defaultAmende, setDefaultAmende] = useState(load("sp.defaultAmende", 0));
+
+        const [overrides, setOverrides] = useState(load("sp.overrides", {}));
+
+        useEffect(() => save("sp.year", year), [year]);
+        useEffect(() => save("sp.month", month), [month]);
+        useEffect(() => save("sp.pattern", pattern), [pattern]);
+        useEffect(() => save("sp.patternStartDate", patternStartDate), [patternStartDate]);
+        useEffect(() => save("sp.patternStartShiftIndex", patternStartShiftIndex), [patternStartShiftIndex]);
+        useEffect(() => save("sp.rateDay", rateDay), [rateDay]);
+        useEffect(() => save("sp.rateNight", rateNight), [rateNight]);
+        useEffect(() => save("sp.defaultPrime", defaultPrime), [defaultPrime]);
+        useEffect(() => save("sp.defaultAmende", defaultAmende), [defaultAmende]);
+        useEffect(() => save("sp.overrides", overrides), [overrides]);
+
+        const firstDay = dateFns.startOfMonth(new Date(year, month, 1));
+        const lastDay = dateFns.endOfMonth(firstDay);
+        const days = dateFns.eachDayOfInterval({ start: firstDay, end: lastDay });
+
+        function shiftForDate(date) {
+          const start = dateFns.parseISO(patternStartDate);
+          const baseIndex = (patternStartShiftIndex || 0) % pattern.length;
+          const delta = dateFns.differenceInCalendarDays(date, start);
+          const idx = ((delta % pattern.length) + pattern.length) % pattern.length;
+          const shiftKey = pattern[(baseIndex + idx) % pattern.length];
+          return SHIFT_TYPES[shiftKey] || SHIFT_TYPES.REPOS;
+        }
+        const dayKey = (date) => dateFns.format(date, "yyyy-MM-dd");
+
+        function getEffectiveDay(date) {
+          const key = dayKey(date);
+          const baseShift = shiftForDate(date);
+          const ov = overrides[key] || {};
+          let shift = baseShift;
+          if (ov.shift && SHIFT_TYPES[ov.shift]) shift = SHIFT_TYPES[ov.shift];
+          if (ov.off) shift = SHIFT_TYPES.OFF;
+          const prime = ov.prime ?? defaultPrime;
+          const amende = ov.amende ?? defaultAmende;
+          const basePay = shift.key === "JOUR" ? Number(rateDay) : shift.key === "NUIT" ? Number(rateNight) : 0;
+          const total = Math.max(0, Number(basePay) + Number(prime || 0) - Number(amende || 0));
+          return { key, date, shift, prime: Number(prime || 0), amende: Number(amende || 0), basePay, total, note: ov.note || "" };
+        }
+
+        const computed = days.map(getEffectiveDay);
+
+        const totals = React.useMemo(() => {
+          const t = { pay: 0, base: 0, prime: 0, amende: 0, J: 0, N: 0, R: 0, O: 0 };
+          for (const d of computed) {
+            t.pay += d.total; t.base += d.basePay; t.prime += d.prime; t.amende += d.amende;
+            if (d.shift.key === "JOUR") t.J++;
+            else if (d.shift.key === "NUIT") t.N++;
+            else if (d.shift.key === "REPOS") t.R++;
+            else if (d.shift.key === "OFF") t.O++;
+          }
+          return t;
+        }, [computed]);
+
+        function updateOverride(key, patch) {
+          setOverrides((cur) => ({ ...cur, [key]: { ...(cur[key] || {}), ...patch } }));
+        }
+
+        function clearMonthOverrides() {
+          const clone = { ...overrides };
+          for (const d of days) delete clone[dayKey(d)];
+          setOverrides(clone);
+        }
+
+        function exportCSV() {
+          const header = ["Date","Jour semaine","Type","Base","Prime","Amende","Total","Note"];
+          const rows = computed.map((d) => [
+            dateFns.format(d.date, "yyyy-MM-dd"),
+            dateFns.format(d.date, "EEEE", { locale: fr }),
+            d.shift.label, d.basePay, d.prime, d.amende, d.total, (d.note||"").replaceAll("\\n", " ")
+          ]);
+          rows.unshift(header);
+          const csv = rows.map((r) => r.join(",")).join("\\n");
+          const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a"); a.href = url;
+          const m = String(month + 1).padStart(2, "0");
+          a.download = `shift-planner_${year}-${m}.csv`; a.click();
+          URL.revokeObjectURL(url);
+        }
+
+        const MonthPicker = () => (
+          <div className="flex flex-wrap items-end gap-3">
+            <div className="flex flex-col">
+              <label className="text-xs text-zinc-500">Mois</label>
+              <select className="px-3 py-2 rounded-xl border bg-white" value={month} onChange={(e) => setMonth(Number(e.target.value))}>
+                {Array.from({ length: 12 }).map((_, i) => (
+                  <option key={i} value={i}>{dateFns.format(new Date(2024, i, 1), "LLLL", { locale: fr })}</option>
+                ))}
+              </select>
+            </div>
+            <div className="flex flex-col">
+              <label className="text-xs text-zinc-500">Année</label>
+              <input className="px-3 py-2 rounded-xl border w-28" type="number" min="1970" max="2100" value={year} onChange={(e) => setYear(Number(e.target.value))} />
+            </div>
+            <button onClick={clearMonthOverrides} className="ml-auto px-3 py-2 rounded-xl border hover:bg-zinc-50">Réinitialiser les modifications du mois</button>
+            <button onClick={exportCSV} className="px-3 py-2 rounded-xl border hover:bg-zinc-50">Exporter CSV</button>
+          </div>
+        );
+
+        const Settings = () => (
+          <div className="grid md:grid-cols-2 gap-4">
+            <div className="p-4 rounded-2xl border bg-white shadow-sm">
+              <div className="font-semibold mb-3">Taux & règles</div>
+              <div className="grid grid-cols-2 gap-3">
+                <LabeledInput label="Taux Jour" suffix="€/jour" value={rateDay} onChange={setRateDay} />
+                <LabeledInput label="Taux Nuit" suffix="€/nuit" value={rateNight} onChange={setRateNight} />
+                <LabeledInput label="Prime par défaut" suffix="€" value={defaultPrime} onChange={setDefaultPrime} />
+                <LabeledInput label="Amende par défaut" suffix="€" value={defaultAmende} onChange={setDefaultAmende} />
+              </div>
+              <p className="mt-3 text-xs text-zinc-500">Astuce: vous pouvez ensuite ajuster prime/amende par jour dans le calendrier.</p>
+            </div>
+
+            <div className="p-4 rounded-2xl border bg-white shadow-sm">
+              <div className="font-semibold mb-3">Patron d'équipe (2J-2R-2N)</div>
+              <div className="grid sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="text-xs text-zinc-500">Date de départ du patron</label>
+                  <input className="w-full px-3 py-2 rounded-xl border" type="date" value={patternStartDate} onChange={(e) => setPatternStartDate(e.target.value)} />
+                </div>
+                <div>
+                  <label className="text-xs text-zinc-500">Décalage initial (0 = Jour)</label>
+                  <input className="w-full px-3 py-2 rounded-xl border" type="number" min="0" max={pattern.length - 1} value={patternStartShiftIndex} onChange={(e) => setPatternStartShiftIndex(Number(e.target.value))} />
+                </div>
+                <div className="sm:col-span-2">
+                  <label className="text-xs text-zinc-500">Patron (modifiable)</label>
+                  <PatternEditor pattern={pattern} setPattern={setPattern} />
+                </div>
+              </div>
+              <p className="mt-3 text-xs text-zinc-500">Le patron se répète indéfiniment. Utilisez les congés pour marquer des jours off exceptionnels.</p>
+            </div>
+          </div>
+        );
+
+        const PatternEditor = ({ pattern, setPattern }) => {
+          const rotate = (arr, dir = 1) => {
+            const a = [...arr];
+            if (dir > 0) a.push(a.shift()); else a.unshift(a.pop());
+            setPattern(a);
+          };
+          return (
+            <div className="flex items-center gap-2 flex-wrap">
+              <button className="px-2 py-1 border rounded-lg" onClick={() => rotate(pattern, -1)}>⟲</button>
+              {pattern.map((p, i) => (
+                <select key={i} className={`px-3 py-2 rounded-xl border ${SHIFT_TYPES[p].color}`} value={p}
+                  onChange={(e) => setPattern(pattern.map((v, j) => (j === i ? e.target.value : v)))}>
+                  {Object.values(SHIFT_TYPES).filter((t) => t.key !== SHIFT_TYPES.OFF.key).map((t) => (
+                    <option key={t.key} value={t.key}>{t.label}</option>
+                  ))}
+                </select>
+              ))}
+              <button className="px-2 py-1 border rounded-lg" onClick={() => rotate(pattern, 1)}>⟳</button>
+            </div>
+          );
+        };
+
+        const Calendar = () => (
+          <div className="rounded-2xl border bg-white shadow-sm overflow-hidden">
+            <div className="flex items-center justify-between px-4 py-3 border-b bg-zinc-50">
+              <div className="font-semibold">{dateFns.format(firstDay, "LLLL yyyy", { locale: fr })}</div>
+              <div className="text-sm text-zinc-600">J: {totals.J} • N: {totals.N} • R: {totals.R} • O: {totals.O}</div>
+            </div>
+            <div className="grid grid-cols-7 text-xs bg-zinc-50 border-b">
+              {["Lun","Mar","Mer","Jeu","Ven","Sam","Dim"].map((d) => (<div key={d} className="p-2 text-center text-zinc-500">{d}</div>))}
+            </div>
+            <div className="grid grid-cols-7 gap-px bg-zinc-200">
+              {renderLeadingEmpty(firstDay)}
+              {computed.map((d) => (<DayCell key={d.key} data={d} />))}
+            </div>
+            <div className="flex flex-wrap items-center justify-between p-4 text-sm">
+              <div className="font-medium">Total: {prettyMoney(totals.pay)}</div>
+              <div className="text-zinc-600">Base: {prettyMoney(totals.base)} • Primes: {prettyMoney(totals.prime)} • Amendes: {prettyMoney(totals.amende)}</div>
+            </div>
+          </div>
+        );
+
+        function renderLeadingEmpty(first) {
+          const weekday = ((first.getDay() + 6) % 7) + 1;
+          const empties = weekday - 1;
+          return Array.from({ length: empties }).map((_, i) => <div key={`e-${i}`} className="bg-white" />);
+        }
+
+        const DayCell = ({ data }) => {
+          const { date, shift, basePay, prime, amende, total, key, note } = data;
+          const ov = overrides[key] || {};
+          return (
+            <div className="bg-white p-2 min-h-28 flex flex-col border border-zinc-100">
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-[11px] text-zinc-500">{dateFns.format(date, "dd LLL", { locale: fr })}</div>
+                <div className={`text-[11px] px-2 py-0.5 rounded-full border ${shift.color}`}>{shift.code}</div>
+              </div>
+              <div className="mt-2 grid grid-cols-2 gap-1 items-center text-[11px]">
+                <label className="text-zinc-500">Type</label>
+                <select className="px-2 py-1 border rounded-lg" value={ov.shift || ""}
+                  onChange={(e) => updateOverride(key, { shift: e.target.value || undefined })}>
+                  <option value="">(patron)</option>
+                  {Object.values(SHIFT_TYPES).map((t) => (<option key={t.key} value={t.key}>{t.label}</option>))}
+                </select>
+                <label className="text-zinc-500">Congé</label>
+                <input type="checkbox" className="h-4 w-4" checked={!!ov.off}
+                  onChange={(e) => updateOverride(key, { off: e.target.checked || undefined })} />
+                <label className="text-zinc-500">Prime</label>
+                <MoneyInput value={ov.prime} placeholder={String(defaultPrime)} onChange={(v) => updateOverride(key, { prime: v })} />
+                <label className="text-zinc-500">Amende</label>
+                <MoneyInput value={ov.amende} placeholder={String(defaultAmende)} onChange={(v) => updateOverride(key, { amende: v })} />
+              </div>
+              <textarea className="mt-2 w-full px-2 py-1 border rounded-lg text-[11px]" placeholder="Note (optionnel)" rows="2"
+                value={ov.note || ""} onChange={(e) => updateOverride(key, { note: e.target.value })} />
+              <div className="mt-2 text-[11px] flex justify-between text-zinc-600">
+                <span>Base {prettyMoney(basePay)}</span>
+                <span>Total <strong className="text-zinc-800">{prettyMoney(total)}</strong></span>
+              </div>
+            </div>
+          );
+        };
+
+        const LabeledInput = ({ label, value, onChange, suffix, placeholder }) => (
+          <div className="flex flex-col">
+            <label className="text-xs text-zinc-500">{label}</label>
+            <div className="flex items-center gap-2">
+              <input className="px-3 py-2 rounded-xl border w-full" type="number" value={value} placeholder={placeholder}
+                onChange={(e) => onChange(Number(e.target.value))} />
+              {suffix && <span className="text-xs text-zinc-500">{suffix}</span>}
+            </div>
+          </div>
+        );
+
+        const MoneyInput = ({ value, onChange, placeholder }) => (
+          <input className="px-2 py-1 rounded-lg border w-full" type="number" step="0.01" value={value ?? ""} placeholder={placeholder}
+            onChange={(e) => onChange(e.target.value === "" ? undefined : Number(e.target.value))} />
+        );
+
+        function AppShell() {
+          return (
+            <div className="min-h-screen bg-gradient-to-b from-zinc-50 to-white text-zinc-900">
+              <div className="max-w-5xl mx-auto p-4 md:p-6">
+                <header className="mb-4 md:mb-6">
+                  <h1 className="text-2xl md:text-3xl font-bold tracking-tight">Shift Planner – simple</h1>
+                  <p className="text-sm text-zinc-600 mt-1">Patron 2 jours • 2 repos • 2 nuits, congés personnalisés, calcul des salaires, primes et amendes.</p>
+                </header>
+                <div className="sticky top-0 z-10 mb-4 p-3 rounded-2xl border bg-white/80 backdrop-blur supports-[backdrop-filter]:bg-white/60">
+                  <MonthPicker />
+                </div>
+                <main className="space-y-6">
+                  <Settings />
+                  <Calendar />
+                  <div className="p-4 rounded-2xl border bg-white shadow-sm text-sm text-zinc-600">
+                    <div className="font-medium text-zinc-800 mb-2">Mode d'emploi rapide</div>
+                    <ol className="list-decimal ml-5 space-y-1">
+                      <li>Réglez les taux (jour/nuit), la prime et l'amende par défaut.</li>
+                      <li>Choisissez la date de départ du patron et, si besoin, le décalage initial.</li>
+                      <li>Sélectionnez le mois/année à planifier.</li>
+                      <li>Dans le calendrier, ajustez pour chaque jour : type, congé, prime/amende, et note.</li>
+                      <li>Le total du mois se met à jour automatiquement. Exportez en CSV si nécessaire.</li>
+                    </ol>
+                    <p className="mt-2">Toutes les données sont enregistrées automatiquement dans votre navigateur (local). Pas de cloud.</p>
+                  </div>
+                </main>
+                <footer className="py-8 text-center text-xs text-zinc-500">© <span id="year-span"></span> • Outil local de planification d'équipes</footer>
+              </div>
+            </div>
+          );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<AppShell />);
+        document.getElementById("year-span").textContent = new Date().getFullYear();
+      }
+
+      App();
+    </script>
+  </body>
+</html>
